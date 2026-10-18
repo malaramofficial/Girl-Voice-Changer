@@ -2,20 +2,24 @@ package com.example.girlvoicechanger
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
-import android.media.AudioAttributes
-import android.media.AudioManager
 import android.os.Bundle
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.io.ByteArrayOutputStream
+import java.io.OutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlin.math.max
@@ -32,8 +36,11 @@ class MainActivity : Activity() {
     private var recordingThread: Thread? = null
     private val isRecording = AtomicBoolean(false)
     private val pcm = ByteArrayOutputStream()
+    @Volatile private var playbackTrack: AudioTrack? = null
+    @Volatile private var isPlaying = false
     private var statusView: TextView? = null
     private var recordButton: Button? = null
+    private val createWavRequest = 201
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,16 +56,16 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(28, 36, 28, 28)
         }
-        val title = TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = "Girl Voice Changer"
             textSize = 26f
             gravity = Gravity.CENTER
-        }
-        val note = TextView(this).apply {
-            text = "Prototype: record, listen, and try a higher-pitch effect. This is not natural AI voice conversion and does not change WhatsApp live-call audio."
+        })
+        root.addView(TextView(this).apply {
+            text = "Record your voice, save it as WAV, and preview a simple pitch effect."
             textSize = 15f
             setPadding(0, 16, 0, 18)
-        }
+        })
         statusView = TextView(this).apply {
             text = "Ready. Grant microphone permission to begin."
             textSize = 14f
@@ -72,29 +79,37 @@ class MainActivity : Activity() {
         }
         val playOriginal = Button(this).apply {
             text = "Play original"
-            setOnClickListener { playPcm(pcm.toByteArray(), sampleRate) }
+            setOnClickListener { playPcm(getPcmCopy(), sampleRate) }
         }
         val playEffect = Button(this).apply {
-            text = "Play higher-pitch effect"
+            text = "Preview higher pitch (demo)"
             setOnClickListener {
-                // Naive pitch shift by resampling: raises pitch but also shortens playback.
-                val source = pcm.toByteArray()
-                if (source.isNotEmpty()) playPcm(source, (sampleRate * 1.25).toInt())
-                else setStatus("Record some audio first.")
+                val source = getPcmCopy()
+                if (source.isNotEmpty()) {
+                    // Demonstration only: resampling raises pitch but also shortens audio.
+                    playPcm(source, (sampleRate * 1.25).toInt())
+                } else setStatus("Record some audio first.")
             }
         }
-        val limitation = TextView(this).apply {
-            text = "\nImportant limitation\nAndroid does not let an ordinary unrooted app inject its processed microphone audio into WhatsApp calls. Live-call support is not implemented."
-            textSize = 14f
-            setPadding(0, 18, 0, 0)
+        val saveWav = Button(this).apply {
+            text = "Save recording as WAV"
+            setOnClickListener { requestWavSave() }
         }
-        root.addView(title)
-        root.addView(note)
+        val stopPlayback = Button(this).apply {
+            text = "Stop playback"
+            setOnClickListener { stopPlayback() }
+        }
         root.addView(statusView)
         root.addView(recordButton)
         root.addView(playOriginal)
         root.addView(playEffect)
-        root.addView(limitation)
+        root.addView(saveWav)
+        root.addView(stopPlayback)
+        root.addView(TextView(this).apply {
+            text = "\nVoice conversion status\nThe pitch demo is not natural female voice conversion. A properly licensed DSP/neural conversion engine and on-device quality testing are still needed. WhatsApp live-call microphone replacement is not implemented; ordinary unrooted Android apps cannot normally inject processed audio into another app's microphone."
+            textSize = 14f
+            setPadding(0, 18, 0, 0)
+        })
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
@@ -105,8 +120,9 @@ class MainActivity : Activity() {
             return
         }
         if (isRecording.get()) return
+        stopPlayback()
         try {
-            pcm.reset()
+            synchronized(pcm) { pcm.reset() }
             val audioRecord = AudioRecord(
                 MediaRecorder.AudioSource.MIC,
                 sampleRate,
@@ -129,26 +145,90 @@ class MainActivity : Activity() {
                 while (isRecording.get()) {
                     val count = audioRecord.read(buffer, 0, buffer.size)
                     if (count > 0) synchronized(pcm) { pcm.write(buffer, 0, count) }
+                    if (count < 0) {
+                        runOnUiThread { setStatus("Microphone read error: $count") }
+                        break
+                    }
                 }
             }
         } catch (e: Exception) {
             isRecording.set(false)
+            recorder?.release()
+            recorder = null
+            recordButton?.text = "Start recording"
             setStatus("Recording error: ${e.message ?: "unknown error"}")
         }
     }
 
     private fun stopRecording() {
         if (!isRecording.getAndSet(false)) return
-        try {
-            recorder?.stop()
-        } catch (_: Exception) { }
+        try { recorder?.stop() } catch (_: Exception) { }
         recorder?.release()
         recorder = null
-        recordingThread?.join(500)
+        if (Thread.currentThread() != recordingThread) {
+            try { recordingThread?.join(800) } catch (_: InterruptedException) { }
+        }
         recordingThread = null
         recordButton?.text = "Start recording"
-        val size = synchronized(pcm) { pcm.size() }
-        setStatus("Recording saved in memory: ${size / 2 / sampleRate} seconds. It is not saved as a file.")
+        val data = getPcmCopy()
+        setStatus("Recording ready: ${data.size / 2 / sampleRate} seconds. Save it as WAV to keep a copy.")
+    }
+
+    private fun getPcmCopy(): ByteArray = synchronized(pcm) { pcm.toByteArray() }
+
+    private fun requestWavSave() {
+        if (isRecording.get()) {
+            setStatus("Stop recording before saving.")
+            return
+        }
+        if (getPcmCopy().isEmpty()) {
+            setStatus("Record some audio first.")
+            return
+        }
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "audio/wav"
+            putExtra(Intent.EXTRA_TITLE, "girl-voice-recording.wav")
+        }
+        startActivityForResult(intent, createWavRequest)
+    }
+
+    @Deprecated("Use Activity Result APIs in a future update")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != createWavRequest || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val audio = getPcmCopy()
+        thread(name = "WavExporter") {
+            try {
+                contentResolver.openOutputStream(uri)?.use { output ->
+                    writeWav(output, audio)
+                } ?: throw IllegalStateException("Could not open the selected destination")
+                runOnUiThread { setStatus("WAV recording saved successfully.") }
+            } catch (e: Exception) {
+                runOnUiThread { setStatus("Save failed: ${e.message ?: "unknown error"}") }
+            }
+        }
+    }
+
+    private fun writeWav(output: OutputStream, audio: ByteArray) {
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray(Charsets.US_ASCII))
+        header.putInt(36 + audio.size)
+        header.put("WAVE".toByteArray(Charsets.US_ASCII))
+        header.put("fmt ".toByteArray(Charsets.US_ASCII))
+        header.putInt(16)
+        header.putShort(1.toShort()) // PCM
+        header.putShort(1.toShort()) // mono
+        header.putInt(sampleRate)
+        header.putInt(sampleRate * 2)
+        header.putShort(2.toShort()) // block align
+        header.putShort(16.toShort())
+        header.put("data".toByteArray(Charsets.US_ASCII))
+        header.putInt(audio.size)
+        output.write(header.array())
+        output.write(audio)
+        output.flush()
     }
 
     private fun playPcm(data: ByteArray, playbackRate: Int) {
@@ -160,10 +240,11 @@ class MainActivity : Activity() {
             setStatus("Record some audio first.")
             return
         }
+        stopPlayback()
         thread(name = "VoicePlayback") {
             var track: AudioTrack? = null
             try {
-                val min = AudioTrack.getMinBufferSize(
+                val minSize = AudioTrack.getMinBufferSize(
                     playbackRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
                 )
                 track = AudioTrack(
@@ -172,26 +253,46 @@ class MainActivity : Activity() {
                     AudioFormat.Builder().setSampleRate(playbackRate)
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build(),
-                    max(min, 4096),
+                    max(minSize, 4096),
                     AudioTrack.MODE_STREAM,
                     AudioManager.AUDIO_SESSION_ID_GENERATE
                 )
+                playbackTrack = track
+                isPlaying = true
                 track.play()
                 var offset = 0
-                while (offset < data.size) {
+                while (offset < data.size && isPlaying) {
                     val count = min(4096, data.size - offset)
                     val written = track.write(data, offset, count)
                     if (written <= 0) break
                     offset += written
                 }
-                track.stop()
-                runOnUiThread { setStatus("Playback finished.") }
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.stop()
+                runOnUiThread {
+                    if (isPlaying) setStatus("Playback finished.")
+                }
             } catch (e: Exception) {
                 runOnUiThread { setStatus("Playback error: ${e.message ?: "unknown error"}") }
             } finally {
+                isPlaying = false
+                if (playbackTrack === track) playbackTrack = null
                 track?.release()
             }
         }
+    }
+
+    private fun stopPlayback() {
+        isPlaying = false
+        try {
+            playbackTrack?.let { track ->
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) track.pause()
+                track.flush()
+                if (track.state == AudioTrack.STATE_INITIALIZED) {
+                    try { track.stop() } catch (_: Exception) { }
+                }
+            }
+        } catch (_: Exception) { }
+        setStatus("Playback stopped.")
     }
 
     private fun setStatus(message: String) {
@@ -200,6 +301,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         if (isRecording.get()) stopRecording()
+        stopPlayback()
         super.onDestroy()
     }
 }
