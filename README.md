@@ -6,6 +6,7 @@ A Kotlin Android app for recording microphone audio, previewing the original or 
 
 - Microphone recording with runtime permission.
 - Original recording playback.
+- Experimental real-time higher-pitch monitor inside this app (headphones recommended; not a WhatsApp virtual microphone).
 - A simple higher-pitch playback demo.
 - Stop playback control.
 - Export recording as mono 16-bit PCM WAV to a user-selected location.
@@ -13,9 +14,9 @@ A Kotlin Android app for recording microphone audio, previewing the original or 
 
 ## Important limitations
 
-- The pitch demo is **not** natural-sounding female voice conversion. It raises playback sample rate, so it also makes audio shorter/faster.
+- The pitch demo and experimental live monitor are simple resampling effects, not natural-sounding female voice conversion. They alter pitch and timbre and do not preserve formants like a dedicated voice-conversion engine.
 - A natural voice-conversion engine (licensed DSP or neural model), its model assets, performance tuning, and device testing are still required.
-- It does **not** inject audio into WhatsApp or another app's live-call microphone.
+- It does **not** inject audio into WhatsApp or another app's live-call microphone. The live monitor only plays processed audio from this app; use headphones to reduce acoustic feedback.
 - On ordinary, unrooted Android, third-party apps do not have a public API to replace another app's microphone input. A speaker/acoustic workaround would be unreliable and is not equivalent to true microphone injection.
 - Recording is held in memory until the app closes; export it as WAV to keep a copy. Very long recordings can use substantial memory.
 
@@ -40,3 +41,8 @@ Review the license of every future DSP library and model before shipping it. Thi
 
 
 Latest prototype addition: the higher-pitch demo can also be exported as a separate WAV file. This effect raises pitch by playing the samples faster, so the result is shorter and is not natural AI voice conversion.
+
+
+## Latest integration note
+
+An experimental real-time pitch-up monitor has been added for in-app listening. This is not a verified system-wide virtual microphone. MicUp's README advertises virtual-mic routing, but public issue reports describe cases where Shizuku/root routing did not inject processed audio into calls. We should not copy its marketing claims as proof of WhatsApp compatibility. See [MicUp source](https://github.com/papergray/MicUp) and [routing issue reports](https://github.com/papergray/MicUp/issues/2).
