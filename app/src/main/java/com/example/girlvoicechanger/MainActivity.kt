@@ -42,6 +42,7 @@ class MainActivity : Activity() {
     private var statusView: TextView? = null
     private var recordButton: Button? = null
     private val createWavRequest = 201
+    private val createPitchWavRequest = 202
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -94,7 +95,11 @@ class MainActivity : Activity() {
         }
         val saveWav = Button(this).apply {
             text = "Save recording as WAV"
-            setOnClickListener { requestWavSave() }
+            setOnClickListener { requestWavSave(pitchDemo = false) }
+        }
+        val savePitchWav = Button(this).apply {
+            text = "Save higher-pitch demo as WAV"
+            setOnClickListener { requestWavSave(pitchDemo = true) }
         }
         val stopPlayback = Button(this).apply {
             text = "Stop playback"
@@ -105,6 +110,7 @@ class MainActivity : Activity() {
         root.addView(playOriginal)
         root.addView(playEffect)
         root.addView(saveWav)
+        root.addView(savePitchWav)
         root.addView(stopPlayback)
         root.addView(TextView(this).apply {
             text = "\nVoice conversion status\nThe pitch demo is not natural female voice conversion. A properly licensed DSP/neural conversion engine and on-device quality testing are still needed. WhatsApp live-call microphone replacement is not implemented; ordinary unrooted Android apps cannot normally inject processed audio into another app's microphone."
@@ -177,7 +183,7 @@ class MainActivity : Activity() {
 
     private fun getPcmCopy(): ByteArray = synchronized(pcm) { pcm.toByteArray() }
 
-    private fun requestWavSave() {
+    private fun requestWavSave(pitchDemo: Boolean) {
         if (isRecording.get()) {
             setStatus("Stop recording before saving.")
             return
@@ -189,30 +195,37 @@ class MainActivity : Activity() {
         val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "audio/wav"
-            putExtra(Intent.EXTRA_TITLE, "girl-voice-recording.wav")
+            putExtra(
+                Intent.EXTRA_TITLE,
+                if (pitchDemo) "girl-voice-higher-pitch-demo.wav" else "girl-voice-recording.wav"
+            )
         }
-        startActivityForResult(intent, createWavRequest)
+        startActivityForResult(intent, if (pitchDemo) createPitchWavRequest else createWavRequest)
     }
 
     @Deprecated("Use Activity Result APIs in a future update")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != createWavRequest || resultCode != RESULT_OK) return
+        if ((requestCode != createWavRequest && requestCode != createPitchWavRequest) || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
+        val pitchDemo = requestCode == createPitchWavRequest
         val audio = getPcmCopy()
         thread(name = "WavExporter") {
             try {
                 contentResolver.openOutputStream(uri)?.use { output ->
-                    writeWav(output, audio)
+                    val outputRate = if (pitchDemo) (sampleRate * 1.25).toInt() else sampleRate
+                    writeWav(output, audio, outputRate)
                 } ?: throw IllegalStateException("Could not open the selected destination")
-                runOnUiThread { setStatus("WAV recording saved successfully.") }
+                runOnUiThread {
+                    setStatus(if (pitchDemo) "Higher-pitch demo WAV saved. It is faster/shorter, not natural AI conversion." else "WAV recording saved successfully.")
+                }
             } catch (e: Exception) {
                 runOnUiThread { setStatus("Save failed: ${e.message ?: "unknown error"}") }
             }
         }
     }
 
-    private fun writeWav(output: OutputStream, audio: ByteArray) {
+    private fun writeWav(output: OutputStream, audio: ByteArray, outputSampleRate: Int) {
         val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
         header.put("RIFF".toByteArray(Charsets.US_ASCII))
         header.putInt(36 + audio.size)
@@ -221,8 +234,8 @@ class MainActivity : Activity() {
         header.putInt(16)
         header.putShort(1.toShort()) // PCM
         header.putShort(1.toShort()) // mono
-        header.putInt(sampleRate)
-        header.putInt(sampleRate * 2)
+        header.putInt(outputSampleRate)
+        header.putInt(outputSampleRate * 2)
         header.putShort(2.toShort()) // block align
         header.putShort(16.toShort())
         header.put("data".toByteArray(Charsets.US_ASCII))
