@@ -41,6 +41,11 @@ class MainActivity : Activity() {
     @Volatile private var isPlaying = false
     private var statusView: TextView? = null
     private var recordButton: Button? = null
+    private var livePreviewButton: Button? = null
+    @Volatile private var liveRecorder: AudioRecord? = null
+    @Volatile private var liveTrack: AudioTrack? = null
+    @Volatile private var liveThread: Thread? = null
+    private val isLivePreviewing = AtomicBoolean(false)
     private val createWavRequest = 201
     private val createPitchWavRequest = 202
 
@@ -79,6 +84,10 @@ class MainActivity : Activity() {
                 if (isRecording.get()) stopRecording() else startRecording()
             }
         }
+        livePreviewButton = Button(this).apply {
+            text = "Start live high-pitch preview"
+            setOnClickListener { if (isLivePreviewing.get()) stopLivePreview() else startLivePreview() }
+        }
         val playOriginal = Button(this).apply {
             text = "Play original"
             setOnClickListener { playPcm(getPcmCopy(), sampleRate) }
@@ -107,6 +116,7 @@ class MainActivity : Activity() {
         }
         root.addView(statusView)
         root.addView(recordButton)
+        root.addView(livePreviewButton)
         root.addView(playOriginal)
         root.addView(playEffect)
         root.addView(saveWav)
@@ -120,6 +130,100 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
+    /**
+     * Real-time in-app pitch-up monitor. This is intentionally NOT advertised as a
+     * WhatsApp virtual microphone: Android apps cannot generally replace another app's
+     * microphone stream without system-level support.
+     *
+     * This simple resampling effect raises pitch and changes timbre; it is not neural conversion.
+     * Use headphones to avoid acoustic feedback.
+     */
+    private fun startLivePreview() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 100)
+            setStatus("Microphone permission is required for live preview.")
+            return
+        }
+        if (isLivePreviewing.get() || isRecording.get()) {
+            setStatus("Stop recording or live preview before starting another audio mode.")
+            return
+        }
+        stopPlayback()
+        try {
+            val inputRate = sampleRate
+            val pitchRatio = 1.20
+            val outputRate = (inputRate * pitchRatio).toInt()
+            val inputBufferBytes = max(AudioRecord.getMinBufferSize(inputRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT), 4096)
+            val outputMin = AudioTrack.getMinBufferSize(outputRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val outputBufferBytes = max(if (outputMin > 0) outputMin else 8192, 8192)
+            val input = AudioRecord(MediaRecorder.AudioSource.MIC, inputRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, inputBufferBytes)
+            if (input.state != AudioRecord.STATE_INITIALIZED) { input.release(); setStatus("Microphone could not be initialized for live preview."); return }
+            val output = AudioTrack(
+                AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build(),
+                AudioFormat.Builder().setSampleRate(outputRate).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build(),
+                outputBufferBytes, AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE
+            )
+            if (output.state != AudioTrack.STATE_INITIALIZED) { input.release(); output.release(); setStatus("Audio output is not supported by this device."); return }
+            liveRecorder = input
+            liveTrack = output
+            input.startRecording()
+            output.play()
+            isLivePreviewing.set(true)
+            livePreviewButton?.text = "Stop live preview"
+            setStatus("Live high-pitch preview is on in this app only. Use headphones; WhatsApp routing is not enabled.")
+            liveThread = thread(name = "LivePitchPreview") {
+                val inputSamples = ShortArray(1024)
+                val outputSamples = ShortArray((inputSamples.size / pitchRatio).toInt() + 2)
+                try {
+                    while (isLivePreviewing.get()) {
+                        val count = input.read(inputSamples, 0, inputSamples.size, AudioRecord.READ_BLOCKING)
+                        if (count <= 1) continue
+                        val outCount = min(outputSamples.size, (count / pitchRatio).toInt())
+                        for (i in 0 until outCount) {
+                            val sourcePosition = i * pitchRatio
+                            val left = sourcePosition.toInt().coerceIn(0, count - 1)
+                            val right = min(left + 1, count - 1)
+                            val fraction = (sourcePosition - left).toFloat()
+                            val value = inputSamples[left] * (1f - fraction) + inputSamples[right] * fraction
+                            outputSamples[i] = value.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+                        }
+                        var writtenSamples = 0
+                        while (writtenSamples < outCount && isLivePreviewing.get()) {
+                            val written = output.write(outputSamples, writtenSamples, outCount - writtenSamples, AudioTrack.WRITE_BLOCKING)
+                            if (written <= 0) break
+                            writtenSamples += written
+                        }
+                    }
+                } catch (e: Exception) { runOnUiThread { setStatus("Live preview stopped: ${e.message ?: "audio error"}") } }
+                finally {
+                    isLivePreviewing.set(false)
+                    try { input.stop() } catch (_: Exception) {}
+                    input.release()
+                    try { output.stop() } catch (_: Exception) {}
+                    output.release()
+                    if (liveRecorder === input) liveRecorder = null
+                    if (liveTrack === output) liveTrack = null
+                    runOnUiThread { livePreviewButton?.text = "Start live high-pitch preview" }
+                }
+            }
+        } catch (e: Exception) {
+            isLivePreviewing.set(false)
+            liveRecorder?.let { try { it.release() } catch (_: Exception) {} }
+            liveTrack?.let { try { it.release() } catch (_: Exception) {} }
+            liveRecorder = null; liveTrack = null
+            livePreviewButton?.text = "Start live high-pitch preview"
+            setStatus("Could not start live preview: ${e.message ?: "unknown error"}")
+        }
+    }
+
+    private fun stopLivePreview() {
+        if (!isLivePreviewing.getAndSet(false)) return
+        try { liveRecorder?.stop() } catch (_: Exception) {}
+        try { liveTrack?.pause(); liveTrack?.flush(); liveTrack?.stop() } catch (_: Exception) {}
+        livePreviewButton?.text = "Start live high-pitch preview"
+        setStatus("Live preview stopped.")
+    }
+
     private fun startRecording() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 100)
@@ -127,6 +231,7 @@ class MainActivity : Activity() {
             return
         }
         if (isRecording.get()) return
+        stopLivePreview()
         stopPlayback()
         try {
             synchronized(pcm) { pcm.reset() }
@@ -315,6 +420,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         if (isRecording.get()) stopRecording()
+        stopLivePreview()
         stopPlayback()
         super.onDestroy()
     }
