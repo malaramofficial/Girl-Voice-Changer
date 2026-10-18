@@ -37,3 +37,6 @@ The workflow uses Java 17 and Gradle 8.9, runs `assembleDebug`, and uploads the 
 ## License notes
 
 Review the license of every future DSP library and model before shipping it. This starter does not include third-party model weights.
+
+
+Latest prototype addition: the higher-pitch demo can also be exported as a separate WAV file. This effect raises pitch by playing the samples faster, so the result is shorter and is not natural AI voice conversion.
